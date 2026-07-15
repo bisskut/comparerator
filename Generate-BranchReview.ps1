@@ -1,5 +1,5 @@
 ﻿param(
-    [string[]]$Branches = @("dev", "qa", "uat", "prod"),
+    [string[]]$Branches = @("develop", "qa", "uat", "master"),
     [string]$Remote = "origin",
     [string]$OutputDirectory = ".\branch-review",
     [int]$FolderDepth = 2,
@@ -19,17 +19,33 @@ function Invoke-Git {
         [switch]$AllowFailure
     )
 
-    # Windows PowerShell 5.x converts native stderr into NativeCommandError
-    # records when stderr is merged into the success stream. Git also writes
-    # non-fatal warnings to stderr, including multiple-merge-base warnings.
-    # Capture stderr in a file so warnings can be reported without terminating.
+    # Windows PowerShell 5.x may convert native stderr into terminating
+    # NativeCommandError records even when stderr is redirected. Use
+    # Start-Process so stdout and stderr never enter PowerShell's streams.
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
     $stderrFile = [System.IO.Path]::GetTempFileName()
 
     try {
-        $stdout = @(& git @Arguments 2> $stderrFile | ForEach-Object { $_.ToString() })
-        $exitCode = $LASTEXITCODE
+        $gitPath = (Get-Command git -ErrorAction Stop).Source
 
+        $process = Start-Process `
+            -FilePath $gitPath `
+            -ArgumentList $Arguments `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile
+
+        $exitCode = $process.ExitCode
+
+        $stdout = @()
         $stderr = @()
+
+        if (Test-Path $stdoutFile) {
+            $stdout = @(Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue)
+        }
+
         if (Test-Path $stderrFile) {
             $stderr = @(Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue)
         }
@@ -41,16 +57,17 @@ function Invoke-Git {
         }
 
         [PSCustomObject]@{
-            ExitCode = $exitCode
-            Output   = $combined
-            StdOut   = $stdout
-            StdErr   = $stderr
-            Text     = ($combined -join [Environment]::NewLine)
+            ExitCode   = $exitCode
+            Output     = $combined
+            StdOut     = $stdout
+            StdErr     = $stderr
+            Text       = ($combined -join [Environment]::NewLine)
             StdOutText = ($stdout -join [Environment]::NewLine)
             StdErrText = ($stderr -join [Environment]::NewLine)
         }
     }
     finally {
+        Remove-Item -LiteralPath $stdoutFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
     }
 }
