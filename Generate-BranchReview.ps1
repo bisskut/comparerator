@@ -19,17 +19,39 @@ function Invoke-Git {
         [switch]$AllowFailure
     )
 
-    $output = & git @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    # Windows PowerShell 5.x converts native stderr into NativeCommandError
+    # records when stderr is merged into the success stream. Git also writes
+    # non-fatal warnings to stderr, including multiple-merge-base warnings.
+    # Capture stderr in a file so warnings can be reported without terminating.
+    $stderrFile = [System.IO.Path]::GetTempFileName()
 
-    if ($exitCode -ne 0 -and -not $AllowFailure) {
-        throw "Git command failed: git $($Arguments -join ' ')`n$output"
+    try {
+        $stdout = @(& git @Arguments 2> $stderrFile | ForEach-Object { $_.ToString() })
+        $exitCode = $LASTEXITCODE
+
+        $stderr = @()
+        if (Test-Path $stderrFile) {
+            $stderr = @(Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue)
+        }
+
+        $combined = @($stdout + $stderr)
+
+        if ($exitCode -ne 0 -and -not $AllowFailure) {
+            throw "Git command failed: git $($Arguments -join ' ')`n$($combined -join [Environment]::NewLine)"
+        }
+
+        [PSCustomObject]@{
+            ExitCode = $exitCode
+            Output   = $combined
+            StdOut   = $stdout
+            StdErr   = $stderr
+            Text     = ($combined -join [Environment]::NewLine)
+            StdOutText = ($stdout -join [Environment]::NewLine)
+            StdErrText = ($stderr -join [Environment]::NewLine)
+        }
     }
-
-    [PSCustomObject]@{
-        ExitCode = $exitCode
-        Output   = @($output)
-        Text     = ($output -join [Environment]::NewLine)
+    finally {
+        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -438,7 +460,13 @@ function New-PairReport {
 
     $sourceHash = Get-CommitHash $sourceRef
     $targetHash = Get-CommitHash $targetRef
-    $mergeBase  = (Invoke-Git -Arguments @("merge-base", $targetRef, $sourceRef)).Text.Trim()
+    $mergeBaseResult = Invoke-Git -Arguments @("merge-base", "--all", $targetRef, $sourceRef)
+    $mergeBases = @($mergeBaseResult.StdOut | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($mergeBases.Count -eq 0) {
+        throw "No merge base exists between '$targetRef' and '$sourceRef'. The branches may have unrelated histories."
+    }
+    $mergeBase = $mergeBases[0]
+    $hasMultipleMergeBases = ($mergeBases.Count -gt 1)
 
     $sourceAhead = Get-CommitCount "$targetRef..$sourceRef"
     $targetAhead = Get-CommitCount "$sourceRef..$targetRef"
@@ -451,7 +479,13 @@ function New-PairReport {
     $commits = Get-UniqueCommitData -TargetRef $targetRef -SourceRef $sourceRef
     $projects = Get-ProjectSummaries -Files $files -UniqueCommits $commits -SourceRef $sourceRef
     $ageDistribution = Get-AgeDistribution -Commits $commits
-    $riskSignals = Get-RiskSignals -Files $files -Projects $projects
+    $riskSignals = @(Get-RiskSignals -Files $files -Projects $projects)
+    if ($hasMultipleMergeBases) {
+        $riskSignals += [PSCustomObject]@{
+            Severity = "High"
+            Signal   = "$($mergeBases.Count) valid merge bases detected; branch history is crisscrossed and three-dot comparisons may be ambiguous"
+        }
+    }
 
     $commits | Export-Csv (Join-Path $pairDirectory "commits.csv") -NoTypeInformation -Encoding UTF8
     $files   | Export-Csv (Join-Path $pairDirectory "changed-files.csv") -NoTypeInformation -Encoding UTF8
@@ -512,6 +546,8 @@ function New-PairReport {
         SourceCommit = $sourceHash
         TargetCommit = $targetHash
         MergeBase = $mergeBase
+        MergeBases = $mergeBases
+        HasMultipleMergeBases = $hasMultipleMergeBases
         SourceAhead = $sourceAhead
         TargetAhead = $targetAhead
         ChangedFiles = $files.Count
@@ -538,7 +574,9 @@ Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
 | Source commit | ``$sourceHash`` |
 | Target | ``$targetRef`` |
 | Target commit | ``$targetHash`` |
-| Merge base | ``$mergeBase`` |
+| Primary merge base | ``$mergeBase`` |
+| Merge-base count | $($mergeBases.Count) |
+| Multiple merge bases | $hasMultipleMergeBases |
 | Source-only commits | $sourceAhead |
 | Target-only commits | $targetAhead |
 | Changed files | $($files.Count) |
@@ -563,6 +601,12 @@ Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
 This report describes changes introduced on **$SourceBranch** relative to the common ancestor of **$SourceBranch** and **$TargetBranch**.
 
 It does not prove that the branches merge, compile, test, or deploy successfully.
+
+$(if ($hasMultipleMergeBases) {
+"**Branch-history warning:** Git found $($mergeBases.Count) valid merge bases. This usually indicates crisscross merges or repeated bidirectional merging. Three-dot comparisons can depend on the selected merge base, so the larger audit should compare each base or test an actual merge."
+} else {
+""
+})
 
 ## Change Categories
 
